@@ -1,11 +1,13 @@
 use clap::{App, Arg};
-use chrono::{Local, NaiveDate};
-use std::fs::{File, OpenOptions};
+use chrono::{Local, NaiveDate, Timelike};
+use std::fs::{File, OpenOptions, remove_file};
+use std::os::unix::fs;
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
 
 struct Config {
     folder: String,
@@ -35,56 +37,90 @@ fn main() {
         )
         .get_matches();
 
-    if matches.is_present("help") || matches.is_present("version") || !matches.is_present("directory") || !matches.is_present("base_filename") {
+    if matches.is_present("help") || matches.is_present("version") || !matches.is_present("directory") || !matches.is_present("filename") {
         //println!("{}", matches.usage());
         println!("Usage...");
         return;
     }
 
     let config = Config {
-        folder: matches.value_of("folder").unwrap().to_string(),
+        folder: matches.value_of("directory").unwrap().to_string(),
         base_filename: matches.value_of("filename").unwrap().to_string(),
     };
 
-    let date_changed = Arc::new(AtomicBool::new(false));
-    let date_changed_clone = date_changed.clone();
+    // Used to signal when the day changes; if true then the writer should rotate
+    let date_changed = Arc::new(AtomicBool::new(true));
 
-    thread::spawn(move || loop {
-        thread::sleep(Duration::from_secs(60));
+    // Start a thread to monitor when the local date changes.
+    {
+        let date_changed_clone = date_changed.clone();
+        thread::spawn(move || {
+            let mut old_date = Local::now().date_naive();
 
-        let old_date = Local::today().naive_local();
-        let new_date = Local::now().date().naive_local();
-        if old_date != new_date {
-            date_changed_clone.store(true, Ordering::SeqCst);
-        }
-    });
+            loop {
+                // Once we near the end of the hour, poll more frequently
+                if Local::now().minute() >= 59 {
+                    thread::sleep(Duration::from_secs(1));
+                } else {
+                    thread::sleep(Duration::from_secs(60));
+                }
 
-    let mut current_date = Local::today().naive_local();
+                let new_date = Local::now().date_naive();
+                if old_date != new_date {
+                    date_changed_clone.store(true, Ordering::SeqCst);
+                    old_date = new_date;
+                }
+            }
+        });
+    }
+
     let stdin = io::stdin();
     let mut buffer = String::new();
 
+    let mut file = open_log_file(&config);
+
+
     loop {
         buffer.clear();
+
+        // Read all available log data
         let bytes_read = stdin.lock().read_line(&mut buffer).expect("Error reading stdin");
 
+        // Terminate once we reach EOF
         if bytes_read == 0 {
             break;
         }
 
         // If we've been notified that the date has changed, rotate log files
-        // TODO should probably only do this rotation after writing a newline char?
         if date_changed.load(Ordering::SeqCst) {
-            current_date = Local::today().naive_local().pred();
             date_changed.store(false, Ordering::SeqCst);
-        }
 
-        let filepath = format!("{}/{}-{}.log", config.folder, config.base_filename, current_date);
-        let mut file = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&filepath)
-            .expect("Error opening/creating log file");
+            file = open_log_file(&config);
+            // TODO recreate link to latest log file (symlink likely best)
+
+        }
 
         file.write_all(buffer.as_bytes()).expect("Error writing to log file");
     }
+}
+
+/// Opens the log file for the current date.
+/// N.B. limitation is this always creates a date-stamped file, whereas really what we want to do is only do that on rotate...
+fn open_log_file(config: &Config) -> File {
+    let current_date = Local::now().date_naive();
+
+    let filepath = format!("{}/{}-{}", config.folder, config.base_filename, current_date);
+    let file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&filepath)
+        .expect("Error opening/creating log file");
+
+    let link = format!("{}/{}", config.folder, config.base_filename);
+
+    // TODO handle errors
+    remove_file(&link);
+    fs::symlink(filepath, &link);
+
+    file
 }
