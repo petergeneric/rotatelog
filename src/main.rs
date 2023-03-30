@@ -1,6 +1,6 @@
 use clap::{App, Arg};
 use chrono::{Local, Timelike};
-use std::fs::{File, OpenOptions, remove_file};
+use std::fs::{File, OpenOptions, remove_file, symlink_metadata, read_link};
 use std::os::unix::fs;
 use std::io::{self, Write, Result, Read, BufRead};
 use std::path::Path;
@@ -12,6 +12,7 @@ use std::time::Duration;
 struct Config {
     folder: String,
     base_filename: String,
+    gzip_on_rotate: bool,
 }
 
 fn main() -> std::io::Result<()> {
@@ -34,11 +35,20 @@ fn main() -> std::io::Result<()> {
                 .value_name("FILENAME")
                 .help("Specifies the base filename for log files")
                 .takes_value(true).required(true),
+        )
+        .arg(
+            Arg::with_name("compress")
+                .short('c')
+                .long("compress")
+                .value_name("COMPRESS")
+                .help("If supplied, indicates old log files should be compressed")
+                .takes_value(false),
         ).get_matches();
 
     let config = Config {
         folder: matches.value_of("directory").unwrap().to_string(),
         base_filename: matches.value_of("filename").unwrap().to_string(),
+        gzip_on_rotate: matches.is_present("compress"),
     };
 
     // Used to signal when the day changes; if true then the writer should rotate
@@ -62,7 +72,7 @@ fn main() -> std::io::Result<()> {
                     thread::sleep(Duration::from_secs(1));
                 } else {
                     near_end_of_day_clone.store(false, Ordering::SeqCst);
-                    thread::sleep(Duration::from_secs(60));
+                    thread::sleep(Duration::from_secs(59));
                 }
 
                 let new_date = Local::now().date_naive();
@@ -104,8 +114,7 @@ fn main() -> std::io::Result<()> {
         if near_end_of_day.load(Ordering::Relaxed) {
             let bytes_read = stdin.lock().read_until(b'\n', &mut buffer).expect("Error reading stdin");
             buffer.truncate(bytes_read);
-        }
-        else {
+        } else {
             let bytes_read = stdin.lock().read(&mut buffer).expect("Error reading stdin");
             buffer.truncate(bytes_read);
         }
@@ -155,24 +164,111 @@ fn reopen_log_file(config: &Config) -> Result<File> {
     let filename = format!("{}-{}", config.base_filename, formatted_date);
     let filepath = folder.join(&filename);
 
+    // Remove existing link
+    let should_relink;
+    if link.exists() {
+        // Retrieve the metadata for the symlink
+        let link_metadata = symlink_metadata(&link)?;
+
+        // Check if the symlink points at
+        if link_metadata.file_type().is_symlink() {
+            let target_path = read_link(&link)?.canonicalize()?;
+            let old_log_filepath = target_path.as_os_str().to_str().unwrap();
+
+            should_relink = old_log_filepath != filepath.to_str().unwrap();
+
+            if should_relink && config.gzip_on_rotate && !old_log_filepath.ends_with(".gz") {
+                let old_log_file = old_log_filepath.to_owned();
+
+                // Compress the old log file in the background
+                thread::spawn(move || {
+                    gzip_file_and_delete_original(&old_log_file);
+                });
+            }
+        } else {
+            should_relink = true;
+        }
+
+        if should_relink {
+            if let Err(e) = remove_file(&link) {
+                // If the link doesn't exist, don't consider it an error
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(e);
+                }
+            }
+        }
+    } else {
+        should_relink = true;
+    }
+
     let file = OpenOptions::new()
         .append(true)
         .create(true)
         .open(&filepath)?;
 
-    // Remove existing link
-    if link.exists() {
-        if let Err(e) = remove_file(&link) {
-            // If the link doesn't exist, don't consider it an error
-            if e.kind() != std::io::ErrorKind::NotFound {
-                return Err(e);
-            }
+    if should_relink {
+        if let Err(e) = fs::symlink(&filepath, &link) {
+            return Err(e);
         }
     }
 
-    if let Err(e) = fs::symlink(&filepath, &link) {
-        return Err(e);
-    }
-
     Ok(file)
+}
+
+
+fn gzip_file_and_delete_original(file_path: &str) {
+    if is_file_empty(file_path) {
+        // Empty file, just delete; do not display errors if we cannot delete
+        let _ = remove_file(file_path);
+    } else {
+        let gz_file_path = format!("{}.gz", file_path);
+
+        let result = try_gzip_file(file_path, &gz_file_path);
+
+        match result {
+            Ok(_) => {
+                if let Err(e) = remove_file(file_path) {
+                    if Path::new(&file_path).exists() {
+                        eprintln!("GZipped old log file after rotate, could not delete original: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                // Remove the .gz file if there was an error.
+                if let Ok(_) = remove_file(&gz_file_path) {
+                    eprintln!("Error gzipping old log file after rotate: {}", e);
+                } else if Path::new(&gz_file_path).exists() {
+                    eprintln!("Error gzipping old log file after rotate and unable to delete partial .gz file: {}", e);
+                }
+            }
+        }
+    }
+}
+
+fn is_file_empty(file_path: &str) -> bool {
+    use std::fs;
+
+    if let Ok(metadata) = fs::metadata(file_path) {
+        return metadata.len() == 0;
+    }
+    false
+}
+
+fn try_gzip_file(src_file_path: &str, gz_file_path: &String) -> io::Result<()> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+
+    let mut input_file = File::open(src_file_path)?;
+    let mut output_file = File::create(&gz_file_path)?;
+
+    let mut encoder = GzEncoder::new(&mut output_file, Compression::default());
+    let mut buffer = Vec::new();
+    input_file.read_to_end(&mut buffer)?;
+
+    // Write the buffer to the encoder and finish the encoding process.
+    // If there's an error during the gzip process, it will be propagated.
+    match encoder.write_all(&buffer).and(encoder.finish()) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
