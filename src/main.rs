@@ -1,8 +1,9 @@
 use clap::{App, Arg};
-use chrono::{Local, NaiveDate, Timelike};
+use chrono::{Local, Timelike};
 use std::fs::{File, OpenOptions, remove_file};
 use std::os::unix::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write, Result, Read};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -14,7 +15,7 @@ struct Config {
     base_filename: String,
 }
 
-fn main() {
+fn main() -> std::io::Result<()> {
     let matches = App::new("rotatelog")
         .version("1.0")
         .author("Peter Wright")
@@ -40,7 +41,7 @@ fn main() {
     if matches.is_present("help") || matches.is_present("version") || !matches.is_present("directory") || !matches.is_present("filename") {
         //println!("{}", matches.usage());
         println!("Usage...");
-        return;
+        return Ok(());
     }
 
     let config = Config {
@@ -52,6 +53,7 @@ fn main() {
     let date_changed = Arc::new(AtomicBool::new(true));
 
     // Start a thread to monitor when the local date changes.
+    // When date does change, it sets date_changed to true.
     {
         let date_changed_clone = date_changed.clone();
         thread::spawn(move || {
@@ -75,52 +77,72 @@ fn main() {
     }
 
     let stdin = io::stdin();
-    let mut buffer = String::new();
+    let mut buffer = vec![0; 8192];
 
-    let mut file = open_log_file(&config);
-
+    let mut file = open_today_log_file(&config)?;
 
     loop {
         buffer.clear();
 
-        // Read all available log data
-        let bytes_read = stdin.lock().read_line(&mut buffer).expect("Error reading stdin");
+        let bytes_read = stdin.lock().read(&mut buffer).expect("Error reading stdin");
 
-        // Terminate once we reach EOF
         if bytes_read == 0 {
+            // Terminate once we reach EOF
             break;
         }
 
         // If we've been notified that the date has changed, rotate log files
-        if date_changed.load(Ordering::SeqCst) {
+        let has_date_changed = date_changed.load(Ordering::SeqCst);
+
+        if has_date_changed {
             date_changed.store(false, Ordering::SeqCst);
 
-            file = open_log_file(&config);
-            // TODO recreate link to latest log file (symlink likely best)
+            drop(file);
 
+            file = open_today_log_file(&config)?;
+            // TODO recreate link to latest log file (symlink likely best)
         }
 
-        file.write_all(buffer.as_bytes()).expect("Error writing to log file");
+        file.write_all(&buffer[..bytes_read])?;
+
+        // If we only read 1 byte, sleep to let stdin fill up
+        if bytes_read == 1 {
+            thread::sleep(Duration::from_millis(250));
+        }
     }
+
+    Ok(())
 }
 
 /// Opens the log file for the current date.
 /// N.B. limitation is this always creates a date-stamped file, whereas really what we want to do is only do that on rotate...
-fn open_log_file(config: &Config) -> File {
+fn open_today_log_file(config: &Config) -> Result<File> {
     let current_date = Local::now().date_naive();
 
-    let filepath = format!("{}/{}-{}", config.folder, config.base_filename, current_date);
+    let formatted_date = current_date.format("%Y-%m-%d").to_string();
+    let filename = format!("{}-{}", config.base_filename, formatted_date);
+    let filepath = Path::new(&config.folder).join(&filename);
+
     let file = OpenOptions::new()
         .append(true)
         .create(true)
-        .open(&filepath)
-        .expect("Error opening/creating log file");
+        .open(&filepath)?;
 
-    let link = format!("{}/{}", config.folder, config.base_filename);
+    let link = Path::new(&config.folder).join(&config.base_filename);
 
-    // TODO handle errors
-    remove_file(&link);
-    fs::symlink(filepath, &link);
+    // Remove existing link
+    if link.exists() {
+        if let Err(e) = remove_file(&link) {
+            // If the link doesn't exist, don't consider it an error
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(e);
+            }
+        }
+    }
 
-    file
+    if let Err(e) = fs::symlink(&filepath, &link) {
+        return Err(e);
+    }
+
+    Ok(file)
 }
