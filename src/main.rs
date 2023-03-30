@@ -98,7 +98,7 @@ fn main() -> std::io::Result<()> {
     let mut buffer = Vec::with_capacity(8192);
     buffer.resize(8192, 0);
 
-    let mut file = open_today_log_file(&config)?;
+    let mut file = reopen_log_file(&config)?;
 
     loop {
         if near_end_of_day.load(Ordering::Relaxed) {
@@ -123,8 +123,7 @@ fn main() -> std::io::Result<()> {
 
             drop(file);
 
-            file = open_today_log_file(&config)?;
-            // TODO recreate link to latest log file (symlink likely best)
+            file = reopen_log_file(&config)?;
         }
 
         file.write_all(&buffer)?;
@@ -140,7 +139,7 @@ fn main() -> std::io::Result<()> {
 
 /// Opens the log file for the current date.
 /// N.B. limitation is this always creates a date-stamped file, whereas really what we want to do is only do that on rotate...
-fn open_today_log_file(config: &Config) -> Result<File> {
+fn reopen_log_file(config: &Config) -> Result<File> {
     let date_format;
     if cfg!(debug_assertions) {
         date_format = "%Y-%m-%d.%H%M%S";
@@ -148,16 +147,18 @@ fn open_today_log_file(config: &Config) -> Result<File> {
         date_format = "%Y-%m-%d";
     }
 
+    let folder = Path::new(&config.folder);
+
+    let link = folder.join(&config.base_filename);
+
     let formatted_date = Local::now().format(date_format).to_string();
     let filename = format!("{}-{}", config.base_filename, formatted_date);
-    let filepath = Path::new(&config.folder).join(&filename);
+    let filepath = folder.join(&filename);
 
     let file = OpenOptions::new()
         .append(true)
         .create(true)
         .open(&filepath)?;
-
-    let link = Path::new(&config.folder).join(&config.base_filename);
 
     // Remove existing link
     if link.exists() {
