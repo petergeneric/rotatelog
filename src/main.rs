@@ -2,13 +2,12 @@ use clap::{App, Arg};
 use chrono::{Local, Timelike};
 use std::fs::{File, OpenOptions, remove_file};
 use std::os::unix::fs;
-use std::io::{self, Write, Result, Read};
+use std::io::{self, Write, Result, Read, BufRead};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-
 
 struct Config {
     folder: String,
@@ -26,7 +25,7 @@ fn main() -> std::io::Result<()> {
                 .long("directory")
                 .value_name("DIRECTORY")
                 .help("Specifies the folder for log files")
-                .takes_value(true),
+                .takes_value(true).required(true),
         )
         .arg(
             Arg::with_name("filename")
@@ -34,15 +33,8 @@ fn main() -> std::io::Result<()> {
                 .long("filename")
                 .value_name("FILENAME")
                 .help("Specifies the base filename for log files")
-                .takes_value(true),
-        )
-        .get_matches();
-
-    if matches.is_present("help") || matches.is_present("version") || !matches.is_present("directory") || !matches.is_present("filename") {
-        //println!("{}", matches.usage());
-        println!("Usage...");
-        return Ok(());
-    }
+                .takes_value(true).required(true),
+        ).get_matches();
 
     let config = Config {
         folder: matches.value_of("directory").unwrap().to_string(),
@@ -51,19 +43,25 @@ fn main() -> std::io::Result<()> {
 
     // Used to signal when the day changes; if true then the writer should rotate
     let date_changed = Arc::new(AtomicBool::new(true));
+    let near_end_of_day = Arc::new(AtomicBool::new(true));
 
     // Start a thread to monitor when the local date changes.
     // When date does change, it sets date_changed to true.
     {
         let date_changed_clone = date_changed.clone();
+        let near_end_of_day_clone = near_end_of_day.clone();
+
         thread::spawn(move || {
             let mut old_date = Local::now().date_naive();
+
+            near_end_of_day_clone.store(true, Ordering::SeqCst);
 
             loop {
                 // Once we near the end of the hour, poll more frequently
                 if Local::now().minute() >= 59 {
                     thread::sleep(Duration::from_secs(1));
                 } else {
+                    near_end_of_day_clone.store(false, Ordering::SeqCst);
                     thread::sleep(Duration::from_secs(60));
                 }
 
@@ -76,17 +74,43 @@ fn main() -> std::io::Result<()> {
         });
     }
 
+    if cfg!(debug_assertions) {
+        let date_changed_clone = date_changed.clone();
+
+        thread::spawn(move || {
+            use signal_hook::{iterator::Signals, consts::signal::SIGUSR1};
+
+            let mut signals = Signals::new(&[SIGUSR1]).expect("Error setting up SIGUSR1 handler");
+
+            for sig in signals.forever() {
+                match sig {
+                    SIGUSR1 => {
+                        eprintln!("SIGUSR1 received; rotating log file");
+                        date_changed_clone.store(true, Ordering::SeqCst);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        });
+    }
+
     let stdin = io::stdin();
-    let mut buffer = vec![0; 8192];
+    let mut buffer = Vec::with_capacity(8192);
+    buffer.resize(8192, 0);
 
     let mut file = open_today_log_file(&config)?;
 
     loop {
-        buffer.clear();
+        if near_end_of_day.load(Ordering::Relaxed) {
+            let bytes_read = stdin.lock().read_until(b'\n', &mut buffer).expect("Error reading stdin");
+            buffer.truncate(bytes_read);
+        }
+        else {
+            let bytes_read = stdin.lock().read(&mut buffer).expect("Error reading stdin");
+            buffer.truncate(bytes_read);
+        }
 
-        let bytes_read = stdin.lock().read(&mut buffer).expect("Error reading stdin");
-
-        if bytes_read == 0 {
+        if buffer.len() == 0 {
             // Terminate once we reach EOF
             break;
         }
@@ -103,10 +127,10 @@ fn main() -> std::io::Result<()> {
             // TODO recreate link to latest log file (symlink likely best)
         }
 
-        file.write_all(&buffer[..bytes_read])?;
+        file.write_all(&buffer)?;
 
         // If we only read 1 byte, sleep to let stdin fill up
-        if bytes_read == 1 {
+        if buffer.len() == 1 {
             thread::sleep(Duration::from_millis(250));
         }
     }
@@ -117,9 +141,14 @@ fn main() -> std::io::Result<()> {
 /// Opens the log file for the current date.
 /// N.B. limitation is this always creates a date-stamped file, whereas really what we want to do is only do that on rotate...
 fn open_today_log_file(config: &Config) -> Result<File> {
-    let current_date = Local::now().date_naive();
+    let date_format;
+    if cfg!(debug_assertions) {
+        date_format = "%Y-%m-%d.%H%M%S";
+    } else {
+        date_format = "%Y-%m-%d";
+    }
 
-    let formatted_date = current_date.format("%Y-%m-%d").to_string();
+    let formatted_date = Local::now().format(date_format).to_string();
     let filename = format!("{}-{}", config.base_filename, formatted_date);
     let filepath = Path::new(&config.folder).join(&filename);
 
