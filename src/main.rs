@@ -80,6 +80,7 @@ fn main() -> std::io::Result<()> {
         });
     }
 
+    // In debug mode, rotate on SIGUSR1 instead of new day
     if cfg!(debug_assertions) {
         let date_changed_clone = date_changed.clone();
 
