@@ -2,12 +2,13 @@ use clap::{App, Arg};
 use chrono::{Local, Timelike};
 use std::fs::{File, OpenOptions, remove_file, symlink_metadata, read_link};
 use std::os::unix::fs;
-use std::io::{self, Write, Result, Read, BufRead};
+use std::io::{self, Write, Result, Read};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use linereader::LineReader;
 
 struct Config {
     folder: String,
@@ -52,26 +53,21 @@ fn main() -> std::io::Result<()> {
     };
 
     // Used to signal when the day changes; if true then the writer should rotate
-    let date_changed = Arc::new(AtomicBool::new(true));
-    let near_end_of_day = Arc::new(AtomicBool::new(true));
+    let date_changed = Arc::new(AtomicBool::new(false));
 
     // Start a thread to monitor when the local date changes.
     // When date does change, it sets date_changed to true.
     {
         let date_changed_clone = date_changed.clone();
-        let near_end_of_day_clone = near_end_of_day.clone();
 
         thread::spawn(move || {
             let mut old_date = Local::now().date_naive();
-
-            near_end_of_day_clone.store(true, Ordering::SeqCst);
 
             loop {
                 // Once we near the end of the hour, poll more frequently
                 if Local::now().minute() >= 59 {
                     thread::sleep(Duration::from_secs(1));
                 } else {
-                    near_end_of_day_clone.store(false, Ordering::SeqCst);
                     thread::sleep(Duration::from_secs(59));
                 }
 
@@ -104,25 +100,15 @@ fn main() -> std::io::Result<()> {
         });
     }
 
-    let stdin = io::stdin();
-    let mut buffer = Vec::with_capacity(8192);
-    buffer.resize(8192, 0);
 
     let mut file = reopen_log_file(&config)?;
 
-    loop {
-        if near_end_of_day.load(Ordering::Relaxed) {
-            let bytes_read = stdin.lock().read_until(b'\n', &mut buffer).expect("Error reading stdin");
-            buffer.truncate(bytes_read);
-        } else {
-            let bytes_read = stdin.lock().read(&mut buffer).expect("Error reading stdin");
-            buffer.truncate(bytes_read);
-        }
+    let stdin = io::stdin().lock();
+    let mut reader = LineReader::new(stdin);
 
-        if buffer.len() == 0 {
-            // Terminate once we reach EOF
-            break;
-        }
+    // Get batch of full lines from stdin and write them to disk
+    while let Some(batch) = reader.next_batch() {
+        let lines = batch.expect("read error");
 
         // If we've been notified that the date has changed, rotate log files
         let has_date_changed = date_changed.load(Ordering::SeqCst);
@@ -135,10 +121,10 @@ fn main() -> std::io::Result<()> {
             file = reopen_log_file(&config)?;
         }
 
-        file.write_all(&buffer)?;
+        file.write_all(&lines)?;
 
         // If we only read 1 byte, sleep to let stdin fill up
-        if buffer.len() == 1 {
+        if lines.len() == 1 {
             thread::sleep(Duration::from_millis(250));
         }
     }
@@ -146,8 +132,9 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-/// Opens the log file for the current date.
-/// N.B. limitation is this always creates a date-stamped file, whereas really what we want to do is only do that on rotate...
+/// Opens the log file for the current date; creates and writes to a date-stamped file
+/// We maintain a symlink for the base filename -> the current datestamped log file
+/// In debug mode, the file gets a time suffix too
 fn reopen_log_file(config: &Config) -> Result<File> {
     let date_format;
     if cfg!(debug_assertions) {
